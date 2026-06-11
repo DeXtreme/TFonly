@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-: ${RESOURCE_PATTERN='(?<=#\s)[\w\[\]\."]+'}
+: ${RESOURCE_PATTERN='(?<=#\s)[^\s]+'}
 : ${ACTION_PATTERN='(?<=\sbe\s)[^\s]+'}
-: ${TERRASPACE_STACK=""}
-: ${DRY_RUN=false}
+: ${TERRASPACE_STACK=}
+: ${DRY_RUN=}
 
 : ${DIALOG_OK=0}
 : ${DIALOG_CANCEL=1}
@@ -23,11 +23,10 @@ help() {
 } 
 
 
-apply() {
-    local resources=("$@")
-
+apply() { 
+    
     local targets=()
-    for resource in "${resources[@]}"; do
+    for resource in $@; do
         targets+=("-target=$resource")
     done
     
@@ -41,63 +40,56 @@ apply() {
 }
 
 remove() {
-    local resources=("$@")
-    if [[ "$DRY_RUN" == true ]]; then
-        resources=("-dry-run" ${resources[@]})
-    fi
+    # local resources=("$@")
+    # if [[ "$DRY_RUN" == true ]]; then
+    #     resources=("-dry-run" ${resources[@]})
+    # fi
 
     if [[ -n "$TERRASPACE_STACK" ]];then
-        terraspace state rm $TERRASPACE_STACK "${resources[@]}"
+        terraspace state rm "${DRY_RUN}" "$@"
     else
-        terraform state rm "${resources[@]}"
+        terraform state rm "${DRY_RUN}" "$@"
     fi
 }
 
 move() {
-    local resources=($@)
-    if [[ "$DRY_RUN" == true ]]; then
-        resources=("-dry-run" ${resources[@]})
-    fi
+    #local resources=("$@")
+    # if [[ "$DRY_RUN" == true ]]; then
+    #     resources=("-dry-run" ${resources[@]})
+    # fi
 
     exec 3>&1
-    transform_regex=$(dialog --title "Terraform Only" --clear \
-    --inputbox "Enter the regex to transform resource names (eg. old/new):" 0 0 2>&1 1>&3)
+    script=$(dialog --title "Terraform Only" --clear \
+    --inputbox "Enter the sed script to transform resource names (eg. s/old/new/):" 0 0 2>&1 1>&3)
 
     return_value=$?
     exec 3>&-
 
     case $return_value in
         $DIALOG_OK)
-            echo "Transform regex: $transform_regex"
+            echo "Sed script: $script"
+            for resource in $@; do
+                new_resource=$(sed -E "$script" <<< "$resource")
+                if [[ -n "$TERRASPACE_STACK" ]];then
+                    terraspace state mv "${DRY_RUN}" "$resource" "$new_resource"
+                else
+                    terraform state mv "${DRY_RUN}" "$resource" "$new_resource"
+                fi
+            done
             ;;
-        $DIALOG_CANCEL)
-            echo "Operation cancelled."
-            return
-            ;;
-        $DIALOG_HELP)
-            help
+        $DIALOG_CANCEL|$DIALOG_ESC|$DIALOG_EXTRA)
             return
             ;;
         *)
             echo "An unexpected error occurred."
-            return
+            exit 1
             ;;
     esac
-
-    for resource in "${resources[@]}"; do
-        new_resource=$(echo "$resource" | sed -E "s/$transform_regex/")
-        if [[ -n "$TERRASPACE_STACK" ]];then
-            terraspace state mv $TERRASPACE_STACK "$resource" "$new_resource"
-        else
-            terraform state mv "$resource" "$new_resource"
-        fi
-    done
-
 }
 
 
 menu() {
-    local selected_resources=("$@")
+     #local selected_resources=("$@")
 
     exec 3>&1
     action=$(dialog --title "Terraform Only" --clear \
@@ -111,18 +103,15 @@ menu() {
 
     case $return_value in
         $DIALOG_OK)
-            echo "Selected action: $action"
-            echo "$action" "${selected_resources[@]}"
-            "$action" "${selected_resources[@]}"
+            #"$action" "${selected_resources[@]}"
+            "$action" "$@"
             ;;
-        $DIALOG_CANCEL)
-            echo "Operation cancelled."
-            ;;
-        $DIALOG_HELP)
-            help
+        $DIALOG_CANCEL|$DIALOG_ESC|$DIALOG_EXTRA)
+            return
             ;;
         *)
             echo "An unexpected error occurred."
+            exit 1
             ;;
     esac
 }
@@ -133,34 +122,31 @@ main() {
     declare -A resources
 
     if [[ -n "$TERRASPACE_STACK" ]];then
-        plan=$(terraspace plan $TERRASPACE_STACK)
+        plan=$(terraspace plan "$TERRASPACE_STACK")
     else
         plan=$(terraform plan)
     fi
 
     while read -r line; do
-        resource=$(grep -Po "$RESOURCE_PATTERN" <<< "$line")
+        resource=$(grep -Po "$RESOURCE_PATTERN" <<< "$line"| sed 's/\x1b\[[0-9;]*m//g')
         if [[ -n "$resource" ]]; then
-            action=$(grep -Po "$ACTION_PATTERN" <<< "$line")
+            action=$(grep -Po "$ACTION_PATTERN" <<< "$line"| sed 's/\x1b\[[0-9;]*m//g')
             if [[ -n "$action" ]]; then    
-                if [[ "$action" =~ destroyed ]]; then
-                    action="destroyed"
-                elif [[ "$action" =~ replaced ]]; then
-                    action="replaced"
-                fi
+                # if [[ "$action" =~ destroyed ]]; then
+                #     action="destroyed"
+                # elif [[ "$action" =~ replaced ]]; then
+                #     action="replaced"
+                # fi
                 resources["$resource"]="$action"
             fi
         fi
-    done <<< $plan
+    done <<< "$plan"
 
     if [[ ${#resources[@]} -eq 0 ]]; then
         echo "No resources found matching the pattern."
-        exit 1
+        return
     fi
 
-
-    # tmp_file=$(mktemp 2>/dev/null) || tmp_file=/tmp/test$$
-    # trap "rm -f $tmp_file;clear" 0 1 2 3 15
     
     options=()
     for resource in "${!resources[@]}"; do
@@ -177,18 +163,14 @@ main() {
 
     case $return_value in
         $DIALOG_OK)
-            echo "Selected resources: $selected"
-            menu $selected
+            menu "$selected"
             ;;
-        $DIALOG_CANCEL)
-            echo "Operation cancelled."
-            ;;
-        $DIALOG_HELP)
-            help
+        $DIALOG_CANCEL|$DIALOG_ESC|$DIALOG_EXTRA)
+            return
             ;;
         *)
-            cat "$tmp_file"
             echo "An unexpected error occurred."
+            exit 1
             ;;
     esac
 }
@@ -203,7 +185,7 @@ while getopts "de:t:h" opt; do
             TERRASPACE_STACK="$OPTARG"
             ;;
         d)
-            DRY_RUN=true
+            DRY_RUN="-dry-run"
             ;;
         h)
             help
